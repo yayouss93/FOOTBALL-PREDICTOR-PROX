@@ -1,330 +1,215 @@
-require("dotenv").config();
 
-const express = require("express");
-const path = require("path");
+const freeAnalysisCache = new Map();
+const teamHistoryCache = new Map();
+let lastHistoryRequestAt = 0;
 
-const app = express();
+const FREE_CACHE_MS = 12 * 60 * 60 * 1000;
 
-// Configuration du serveur
-const PORT = process.env.PORT || 10000;
-const TIMEZONE = process.env.TIMEZONE || "Africa/Abidjan";
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-// Clés API
-const API_KEY =
-  process.env.FOOTBALL_DATA_TOKEN || process.env.APIFOOTBALL_KEY;
+async function getTeamHistory(teamId, competitionCode) {
+  const cacheKey = `${teamId}:${competitionCode || "all"}`;
+  const cached = teamHistoryCache.get(cacheKey);
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.5";
+  if (cached && Date.now() - cached.timestamp < FREE_CACHE_MS) {
+    return cached.matches;
+  }
 
-const API_BASE = "https://api.football-data.org/v4";
+  // Respecter approximativement la limite de l'offre gratuite.
+  const waitMs = Math.max(
+    0,
+    6500 - (Date.now() - lastHistoryRequestAt)
+  );
 
-// Cache en mémoire pour limiter les appels IA répétés
-const aiCache = new Map();
-const AI_CACHE_MS = 12 * 60 * 60 * 1000;
+  if (waitMs > 0) await wait(waitMs);
 
-// Compétitions disponibles
-const COMPETITIONS = {
-  WC: "Coupe du Monde de la FIFA",
-  CL: "Ligue des champions de l'UEFA",
-  BL1: "Bundesliga",
-  DED: "Eredivisie",
-  BSA: "Campeonato Brasileiro Série A",
-  PD: "Première Division espagnole",
-  FL1: "Ligue 1",
-  ELC: "Championship anglais",
-  PPL: "Primeira Liga",
-  EC: "Championnat d'Europe",
-  SA: "Serie A italienne",
-  PL: "Premier League",
-};
+  const url = new URL(`${API_BASE}/teams/${teamId}/matches`);
+  url.searchParams.set("status", "FINISHED");
+  url.searchParams.set("limit", "10");
 
-const DEFAULT_COMPETITIONS = Object.keys(COMPETITIONS);
+  if (competitionCode) {
+    url.searchParams.set("competitions", competitionCode);
+  }
 
-// Servir les fichiers du dossier public
-app.use(express.static(path.join(__dirname, "public")));
+  lastHistoryRequestAt = Date.now();
 
-// Obtenir la date du jour selon le fuseau horaire
-function getToday() {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: TIMEZONE,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date());
+  const response = await fetch(url, {
+    headers: { "X-Auth-Token": API_KEY },
+    signal: AbortSignal.timeout(20000),
+  });
 
-  const values = {};
+  const data = await response.json().catch(() => ({}));
 
-  for (const part of parts) {
-    if (part.type !== "literal") {
-      values[part.type] = part.value;
+  if (!response.ok) {
+    throw new Error(
+      response.status === 429
+        ? "Limite de requêtes football-data.org atteinte. Réessaie plus tard."
+        : `Impossible de récupérer l'historique (${response.status}).`
+    );
+  }
+
+  const matches = (data.matches || []).filter((m) =>
+    m.status === "FINISHED" &&
+    Number.isFinite(m.score?.fullTime?.home) &&
+    Number.isFinite(m.score?.fullTime?.away)
+  );
+
+  teamHistoryCache.set(cacheKey, {
+    timestamp: Date.now(),
+    matches,
+  });
+
+  return matches;
+}
+
+function teamStats(history, teamId) {
+  const games = history
+    .filter((m) =>
+      m.homeTeam?.id === teamId || m.awayTeam?.id === teamId
+    )
+    .slice(0, 10);
+
+  let scored = 0;
+  let conceded = 0;
+  let homeScored = 0;
+  let homeConceded = 0;
+  let homeCount = 0;
+  let awayScored = 0;
+  let awayConceded = 0;
+  let awayCount = 0;
+
+  for (const match of games) {
+    const isHome = match.homeTeam?.id === teamId;
+    const gf = isHome
+      ? match.score.fullTime.home
+      : match.score.fullTime.away;
+    const ga = isHome
+      ? match.score.fullTime.away
+      : match.score.fullTime.home;
+
+    scored += gf;
+    conceded += ga;
+
+    if (isHome) {
+      homeScored += gf;
+      homeConceded += ga;
+      homeCount++;
+    } else {
+      awayScored += gf;
+      awayConceded += ga;
+      awayCount++;
     }
   }
 
-  return `${values.year}-${values.month}-${values.day}`;
-}
+  const n = games.length;
 
-// Vérifier le format d'une date
-function isValidDate(date) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-    return false;
-  }
-
-  const parsed = new Date(`${date}T00:00:00Z`);
-
-  return (
-    !Number.isNaN(parsed.getTime()) &&
-    parsed.toISOString().slice(0, 10) === date
-  );
-}
-
-// Déterminer les compétitions demandées
-function getRequestedCompetitions(req) {
-  const requested = req.query.competitions || req.query.competition;
-
-  if (!requested) {
-    return DEFAULT_COMPETITIONS;
-  }
-
-  const codes = String(requested)
-    .split(",")
-    .map((code) => code.trim().toUpperCase())
-    .filter(Boolean);
-
-  if (
-    codes.length === 0 ||
-    codes.some((code) => !Object.hasOwn(COMPETITIONS, code))
-  ) {
-    return null;
-  }
-
-  return [...new Set(codes)];
-}
-
-// Uniformiser les données d'un match
-function mapMatch(match) {
   return {
-    teams: {
-      home: {
-        name: match.homeTeam?.name || "Équipe à domicile",
-      },
-      away: {
-        name: match.awayTeam?.name || "Équipe à l'extérieur",
-      },
-    },
-    league: {
-      name: match.competition?.name || "Compétition inconnue",
-      code: match.competition?.code || null,
-    },
-    fixture: {
-      id: match.id || null,
-      date: match.utcDate || null,
-      status: {
-        short: match.status || "N/A",
-      },
-    },
-    goals: {
-      home: match.score?.fullTime?.home ?? null,
-      away: match.score?.fullTime?.away ?? null,
-    },
+    games: n,
+    scoredAvg: n ? scored / n : null,
+    concededAvg: n ? conceded / n : null,
+    homeScoredAvg: homeCount ? homeScored / homeCount : null,
+    homeConcededAvg: homeCount ? homeConceded / homeCount : null,
+    awayScoredAvg: awayCount ? awayScored / awayCount : null,
+    awayConcededAvg: awayCount ? awayConceded / awayCount : null,
   };
 }
 
-// Vérifier le fonctionnement du serveur et les clés
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok",
-    name: "FOOTBALL-PREDICTOR-PROX",
-    apiKeyConfigured: Boolean(API_KEY),
-    aiKeyConfigured: Boolean(OPENAI_API_KEY),
-    apiProvider: "football-data.org",
-    timezone: TIMEZONE,
-    competitionsConfigured: DEFAULT_COMPETITIONS.length,
-    message: "Serveur démarré",
-  });
-});
+function poisson(lambda, goals) {
+  let p = Math.exp(-lambda);
 
-// Liste des compétitions disponibles
-app.get("/api/competitions", (req, res) => {
-  res.json({
-    count: DEFAULT_COMPETITIONS.length,
-    competitions: Object.entries(COMPETITIONS).map(([code, name]) => ({
-      code,
-      name,
-    })),
-  });
-});
-
-// Récupérer les matchs d'une journée
-async function getFixtures(req, res) {
-  const date = String(req.query.date || getToday());
-
-  if (!isValidDate(date)) {
-    return res.status(400).json({
-      error: "Date invalide. Utilise le format YYYY-MM-DD.",
-    });
+  for (let i = 1; i <= goals; i++) {
+    p *= lambda / i;
   }
 
-  const competitionCodes = getRequestedCompetitions(req);
-
-  if (!competitionCodes) {
-    return res.status(400).json({
-      error: "Code de compétition invalide.",
-      availableCompetitions: COMPETITIONS,
-    });
-  }
-
-  if (!API_KEY) {
-    return res.status(500).json({
-      error: "La clé API football-data.org est absente de Render.",
-    });
-  }
-
-  try {
-    const url = new URL(`${API_BASE}/matches`);
-
-    url.searchParams.set("date", date);
-    url.searchParams.set("competitions", competitionCodes.join(","));
-
-    const response = await fetch(url, {
-      headers: {
-        "X-Auth-Token": API_KEY,
-      },
-      signal: AbortSignal.timeout(20000),
-    });
-
-    const data = await response.json().catch(() => ({}));
-
-    if (!response.ok) {
-      console.error("football-data.org:", response.status, data);
-
-      let message = "football-data.org a signalé un problème.";
-
-      if (response.status === 400) {
-        message = "Requête refusée. Vérifie les filtres et les compétitions.";
-      } else if (response.status === 401) {
-        message = "Jeton API invalide. Vérifie la clé enregistrée sur Render.";
-      } else if (response.status === 403) {
-        message = "Accès refusé. Vérifie les droits de ton compte API.";
-      } else if (response.status === 429) {
-        message = "Limite de requêtes API atteinte. Réessaie plus tard.";
-      }
-
-      return res.status(502).json({
-        error: message,
-        upstreamStatus: response.status,
-        details:
-          data.message ||
-          data.error ||
-          "Aucun détail supplémentaire fourni par l'API.",
-      });
-    }
-
-    const matches = Array.isArray(data.matches) ? data.matches : [];
-
-    const fixtures = matches
-      .map(mapMatch)
-      .sort(
-        (a, b) =>
-          new Date(a.fixture.date || 0) -
-          new Date(b.fixture.date || 0)
-      );
-
-    return res.json({
-      date,
-      timezone: TIMEZONE,
-      results: fixtures.length,
-      competitionsRequested: competitionCodes,
-      parameters: {
-        date,
-        competitions: competitionCodes.join(","),
-      },
-      errors: {},
-      message: fixtures.length
-        ? "Matchs récupérés avec succès depuis football-data.org."
-        : "Aucun match trouvé dans les compétitions accessibles pour cette date.",
-      fixtures,
-    });
-  } catch (error) {
-    console.error("Erreur football-data.org:", error.message);
-
-    return res.status(502).json({
-      error:
-        error.name === "TimeoutError"
-          ? "football-data.org met trop de temps à répondre."
-          : "Impossible de contacter football-data.org.",
-    });
-  }
+  return p;
 }
 
-app.get("/api/fixtures/today", getFixtures);
-app.get("/api/fixtures", getFixtures);
-
-// Extraire le texte d'une réponse OpenAI
-function extractAIText(data) {
-  if (typeof data.output_text === "string" && data.output_text.trim()) {
-    return data.output_text.trim();
+function calculatePrediction(homeStats, awayStats) {
+  if (!homeStats.games || !awayStats.games) {
+    return {
+      available: false,
+      message: "Données historiques insuffisantes pour une estimation fiable.",
+    };
   }
 
-  const parts = [];
+  // Combine les moyennes générales et les tendances domicile/extérieur.
+  const homeAttack =
+    homeStats.homeScoredAvg ?? homeStats.scoredAvg;
+  const homeDefense =
+    homeStats.homeConcededAvg ?? homeStats.concededAvg;
+  const awayAttack =
+    awayStats.awayScoredAvg ?? awayStats.scoredAvg;
+  const awayDefense =
+    awayStats.awayConcededAvg ?? awayStats.concededAvg;
 
-  for (const item of data.output || []) {
-    if (item.type !== "message") continue;
+  const homeGoals = Math.max(
+    0.15,
+    Math.min(5, (homeAttack + awayDefense) / 2)
+  );
 
-    for (const content of item.content || []) {
-      if (
-        (content.type === "output_text" || content.type === "text") &&
-        typeof content.text === "string"
-      ) {
-        parts.push(content.text);
+  const awayGoals = Math.max(
+    0.15,
+    Math.min(5, (awayAttack + homeDefense) / 2)
+  );
+
+  const homeP = Array.from(
+    { length: 9 },
+    (_, g) => poisson(homeGoals, g)
+  );
+
+  const awayP = Array.from(
+    { length: 9 },
+    (_, g) => poisson(awayGoals, g)
+  );
+
+  let homeWin = 0;
+  let draw = 0;
+  let awayWin = 0;
+  let total = 0;
+  let bestScore = { home: 0, away: 0, probability: -1 };
+
+  for (let h = 0; h <= 8; h++) {
+    for (let a = 0; a <= 8; a++) {
+      const p = homeP[h] * awayP[a];
+      total += p;
+
+      if (h > a) homeWin += p;
+      else if (h === a) draw += p;
+      else awayWin += p;
+
+      if (p > bestScore.probability) {
+        bestScore = { home: h, away: a, probability: p };
       }
     }
   }
 
-  return parts.join("\n").trim();
+  const pct = (value) =>
+    Math.round((value / total) * 1000) / 10;
+
+  return {
+    available: true,
+    method: "Estimation statistique de Poisson",
+    estimatedGoals: {
+      home: Math.round(homeGoals * 100) / 100,
+      away: Math.round(awayGoals * 100) / 100,
+    },
+    probabilities: {
+      homeWin: pct(homeWin),
+      draw: pct(draw),
+      awayWin: pct(awayWin),
+    },
+    predictedScore: `${bestScore.home}-${bestScore.away}`,
+    historicalMatches: {
+      home: homeStats.games,
+      away: awayStats.games,
+    },
+    warning:
+      "Estimation mathématique, pas une garantie. Les blessures, compositions et autres facteurs ne sont pas inclus.",
+  };
 }
 
-// Extraire les sources citées dans la réponse OpenAI
-function extractAISources(data) {
-  const sources = new Map();
-
-  for (const item of data.output || []) {
-    for (const source of item.action?.sources || []) {
-      if (source.url) {
-        sources.set(source.url, {
-          title: source.title || source.url,
-          url: source.url,
-        });
-      }
-    }
-
-    for (const content of item.content || []) {
-      for (const annotation of content.annotations || []) {
-        if (annotation.url) {
-          sources.set(annotation.url, {
-            title: annotation.title || annotation.url,
-            url: annotation.url,
-          });
-        }
-
-        if (
-          annotation.type === "url_citation" &&
-          annotation.url_citation?.url
-        ) {
-          const citation = annotation.url_citation;
-
-          sources.set(citation.url, {
-            title: citation.title || citation.url,
-            url: citation.url,
-          });
-        }
-      }
-    }
-  }
-
-  return [...sources.values()];
-}
-
-// Analyse IA des matchs de la journée
 app.get("/api/ai-analysis", async (req, res) => {
   const date = String(req.query.date || getToday());
 
@@ -336,206 +221,130 @@ app.get("/api/ai-analysis", async (req, res) => {
 
   if (!API_KEY) {
     return res.status(500).json({
-      error: "La clé football-data.org manque dans les variables Render.",
+      error: "La clé football-data.org manque dans Render.",
     });
   }
 
-  if (!OPENAI_API_KEY) {
-    return res.status(500).json({
-      error: "La variable OPENAI_API_KEY manque dans les variables Render.",
-      help: "Ajoute ta clé API OpenAI dans Render > Environment.",
-    });
-  }
+  const cached = freeAnalysisCache.get(date);
 
-  const cacheKey = `ai:${date}`;
-  const cached = aiCache.get(cacheKey);
-
-  if (cached && Date.now() - cached.timestamp < AI_CACHE_MS) {
-    return res.json({
-      ...cached.data,
-      cached: true,
-    });
+  if (cached && Date.now() - cached.timestamp < FREE_CACHE_MS) {
+    return res.json({ ...cached.data, cached: true });
   }
 
   try {
-    // Étape 1 : récupérer les matchs du jour
-    const fixturesURL = new URL(`${API_BASE}/matches`);
-
-    fixturesURL.searchParams.set("date", date);
-    fixturesURL.searchParams.set(
+    const url = new URL(`${API_BASE}/matches`);
+    url.searchParams.set("date", date);
+    url.searchParams.set(
       "competitions",
       DEFAULT_COMPETITIONS.join(",")
     );
 
-    const fixturesResponse = await fetch(fixturesURL, {
-      headers: {
-        "X-Auth-Token": API_KEY,
-      },
+    const response = await fetch(url, {
+      headers: { "X-Auth-Token": API_KEY },
       signal: AbortSignal.timeout(20000),
     });
 
-    const fixturesData = await fixturesResponse.json().catch(() => ({}));
+    const data = await response.json().catch(() => ({}));
 
-    if (!fixturesResponse.ok) {
-      console.error(
-        "Erreur football-data.org pour l'IA:",
-        fixturesResponse.status,
-        fixturesData
-      );
-
+    if (!response.ok) {
       return res.status(502).json({
-        error: "Impossible de récupérer les matchs pour l'analyse IA.",
-        upstreamStatus: fixturesResponse.status,
-        details: fixturesData.message || fixturesData.error || null,
+        error: "Impossible de récupérer les rencontres.",
+        upstreamStatus: response.status,
+        details: data.message || null,
       });
     }
 
-    const matches = Array.isArray(fixturesData.matches)
-      ? fixturesData.matches
-      : [];
+    const matches = Array.isArray(data.matches) ? data.matches : [];
 
     if (matches.length === 0) {
-      const emptyResult = {
+      return res.json({
         date,
         totalMatches: 0,
         results: [],
-        analysis:
-          "Aucun match n'a été retourné pour cette date dans les compétitions accessibles à ton compte.",
-        sources: [],
+        analysis: "Aucun match trouvé pour cette date.",
         generatedAt: new Date().toISOString(),
-        cached: false,
+      });
+    }
+
+    // Évite de dépasser trop rapidement la limite gratuite.
+    const selected = matches.slice(0, 5);
+    const results = [];
+
+    for (const match of selected) {
+      const homeId = match.homeTeam?.id;
+      const awayId = match.awayTeam?.id;
+      const competitionCode = match.competition?.code || null;
+
+      const item = {
+        match: `${match.homeTeam?.name || "Domicile"} vs ${match.awayTeam?.name || "Extérieur"}`,
+        competition: match.competition?.name || "Compétition inconnue",
+        date: match.utcDate || null,
+        status: match.status || "INCONNU",
       };
 
-      return res.json(emptyResult);
-    }
+      if (!homeId || !awayId) {
+        results.push({
+          ...item,
+          prediction: {
+            available: false,
+            message: "Identifiants des équipes indisponibles.",
+          },
+        });
+        continue;
+      }
 
-    // Limiter à 20 matchs par demande IA
-    const selectedMatches = matches.slice(0, 20);
+      try {
+        const homeHistory = await getTeamHistory(homeId, competitionCode);
+        const awayHistory = await getTeamHistory(awayId, competitionCode);
 
-    const matchList = selectedMatches.map((match, index) => ({
-      numero: index + 1,
-      competition: match.competition?.name || "Compétition inconnue",
-      date: match.utcDate || null,
-      domicile: match.homeTeam?.name || "Équipe inconnue",
-      exterieur: match.awayTeam?.name || "Équipe inconnue",
-      statut: match.status || "INCONNU",
-    }));
+        const homeStats = teamStats(homeHistory, homeId);
+        const awayStats = teamStats(awayHistory, awayId);
 
-    const prompt = `
-Tu es un analyste de football rigoureux. Réponds en français.
+        results.push({
+          ...item,
+          homeStats,
+          awayStats,
+          prediction: calculatePrediction(homeStats, awayStats),
+        });
+      } catch (error) {
+        results.push({
+          ...item,
+          prediction: {
+            available: false,
+            message: error.message,
+          },
+        });
 
-DATE DES MATCHS : ${date}
-FUSEAU HORAIRE DU SITE : ${TIMEZONE}
-
-MATCHS À ANALYSER :
-${JSON.stringify(matchList, null, 2)}
-
-MISSION :
-Pour chaque match fourni, effectue une recherche Web actuelle et analyse,
-dans la mesure où les informations fiables sont disponibles :
-
-1. Les 5 à 10 derniers matchs de chaque équipe.
-2. Les buts marqués et encaissés dans ces matchs.
-3. La forme récente, en distinguant domicile et extérieur lorsque possible.
-4. Les confrontations directes récentes si des données fiables existent.
-5. Les blessures, suspensions et absences importantes confirmées par des sources.
-6. Les probabilités estimées de victoire domicile, match nul et victoire extérieur.
-   Les trois probabilités doivent totaliser environ 100 %.
-7. Un score probable et un bref raisonnement.
-8. Les principales incertitudes et la date des informations consultées.
-
-RÈGLES STRICTES :
-- Recherche des sources récentes et crédibles sur le Web.
-- Ne prétends pas avoir vérifié une statistique si tu ne l'as pas trouvée.
-- N'invente ni résultats récents, ni blessures, ni statistiques, ni sources.
-- Si une information n'est pas disponible, indique clairement « données insuffisantes ».
-- Les probabilités sont des estimations, pas des certitudes.
-- Analyse tous les matchs fournis, dans la limite raisonnable de la réponse.
-- Présente chaque match séparément avec les noms exacts des équipes.
-- Termine chaque analyse par les liens des sources utilisées.
-- Ne garantis jamais un résultat sportif.
-
-Organise la réponse avec des titres lisibles, un match par section.
-`;
-
-    // Étape 2 : demander l'analyse à OpenAI avec recherche Web
-    const aiResponse = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        tools: [{ type: "web_search" }],
-        tool_choice: "required",
-        input: prompt,
-      }),
-      signal: AbortSignal.timeout(180000),
-    });
-
-    const aiData = await aiResponse.json().catch(() => ({}));
-
-    if (!aiResponse.ok) {
-      console.error("Erreur OpenAI:", aiResponse.status, aiData);
-
-      return res.status(502).json({
-        error: "La recherche ou l'analyse OpenAI a échoué.",
-        upstreamStatus: aiResponse.status,
-        details:
-          aiData.error?.message ||
-          "Vérifie la clé API, le modèle configuré et les limites de ton compte OpenAI.",
-      });
-    }
-
-    const analysis = extractAIText(aiData);
-
-    if (!analysis) {
-      return res.status(502).json({
-        error: "OpenAI n'a pas renvoyé de texte d'analyse exploitable.",
-      });
+        // Ne pas multiplier les requêtes si la limite est atteinte.
+        if (error.message.includes("Limite de requêtes")) break;
+      }
     }
 
     const result = {
       date,
+      mode: "Gratuit — sans OpenAI",
       totalMatches: matches.length,
-      analyzedMatches: selectedMatches.length,
-      truncated: matches.length > selectedMatches.length,
-      results: matchList,
-      analysis,
-      sources: extractAISources(aiData),
+      analyzedMatches: results.length,
+      note: matches.length > selected.length
+        ? "Pour limiter les appels API, seuls les cinq premiers matchs sont traités à chaque génération."
+        : "Les estimations utilisent les historiques disponibles.",
+      results,
       generatedAt: new Date().toISOString(),
       cached: false,
     };
 
-    aiCache.set(cacheKey, {
+    freeAnalysisCache.set(date, {
       timestamp: Date.now(),
       data: result,
     });
 
     return res.json(result);
   } catch (error) {
-    console.error("Erreur analyse IA:", error);
+    console.error("Erreur d'analyse gratuite:", error);
 
     return res.status(502).json({
-      error:
-        error.name === "TimeoutError"
-          ? "L'analyse IA a pris trop de temps. Réessaie plus tard."
-          : "Une erreur est survenue pendant l'analyse IA.",
+      error: "L'analyse statistique n'a pas pu être terminée.",
       details: error.message,
     });
   }
-});
-
-// Afficher la page principale du site
-app.get(/.*/, (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
-});
-
-// Démarrer le serveur : une seule déclaration de PORT et un seul app.listen
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Serveur lancé sur le port ${PORT}`);
-  console.log(`Fuseau horaire : ${TIMEZONE}`);
-  console.log(`Clé football-data.org configurée : ${Boolean(API_KEY)}`);
-  console.log(`Clé OpenAI configurée : ${Boolean(OPENAI_API_KEY)}`);
 });
