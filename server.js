@@ -1,15 +1,18 @@
+
 require("dotenv").config();
 
 const express = require("express");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const TIMEZONE = process.env.TIMEZONE || "Africa/Abidjan";
+const API_KEY = process.env.APIFOOTBALL_KEY;
 
-app.use(express.static("public"));
+app.use(express.static(path.join(__dirname, "public")));
 
 function getToday() {
-  const parts = new Intl.DateTimeFormat("en-GB", {
+  const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: TIMEZONE,
     year: "numeric",
     month: "2-digit",
@@ -18,9 +21,7 @@ function getToday() {
 
   const values = {};
   for (const part of parts) {
-    if (part.type !== "literal") {
-      values[part.type] = part.value;
-    }
+    if (part.type !== "literal") values[part.type] = part.value;
   }
 
   return `${values.year}-${values.month}-${values.day}`;
@@ -30,7 +31,8 @@ app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
     name: "FOOTBALL-PREDICTOR-PROX",
-    apiKeyConfigured: Boolean(process.env.APIFOOTBALL_KEY),
+    apiKeyConfigured: Boolean(API_KEY),
+    apiProvider: "football-data.org",
     timezone: TIMEZONE,
     message: "Serveur démarré",
   });
@@ -56,59 +58,72 @@ async function getFixtures(req, res) {
     });
   }
 
-  const apiKey = process.env.APIFOOTBALL_KEY;
-
-  if (!apiKey) {
+  if (!API_KEY) {
     return res.status(500).json({
-      error: "La clé API-Football est absente de la configuration.",
+      error: "La clé football-data.org est absente de la configuration.",
     });
   }
 
   try {
-    const url = new URL("https://v3.football.api-sports.io/fixtures");
-    url.searchParams.set("date", date);
-    url.searchParams.set("timezone", TIMEZONE);
+    const url = new URL("https://api.football-data.org/v4/matches");
+    url.searchParams.set("dateFrom", date);
+    url.searchParams.set("dateTo", date);
 
     const response = await fetch(url, {
-      headers: {
-        "x-apisports-key": apiKey,
-      },
+      headers: { "X-Auth-Token": API_KEY },
       signal: AbortSignal.timeout(15000),
     });
 
     const data = await response.json();
 
-    if (!response.ok || (data.errors && Object.keys(data.errors).length > 0)) {
+    if (!response.ok) {
+      console.error("football-data.org:", response.status, data);
+
       return res.status(502).json({
-        error: "API-Football a signalé un problème.",
+        error: "football-data.org a signalé un problème.",
         upstreamStatus: response.status,
-        parameters: data.parameters || {},
-        errors: data.errors || {},
+        details:
+          data.message ||
+          data.error ||
+          "Vérifie la clé API et les limites du compte.",
       });
     }
 
-    const fixtures = Array.isArray(data.response) ? data.response : [];
+    const matches = Array.isArray(data.matches) ? data.matches : [];
 
-    res.json({
+    const fixtures = matches.map((match) => ({
+      teams: {
+        home: { name: match.homeTeam?.name || "Équipe à domicile" },
+        away: { name: match.awayTeam?.name || "Équipe à l'extérieur" },
+      },
+      league: {
+        name: match.competition?.name || "Compétition inconnue",
+      },
+      fixture: {
+        date: match.utcDate || null,
+        status: { short: match.status || "N/A" },
+      },
+    }));
+
+    return res.json({
       date,
       timezone: TIMEZONE,
       results: fixtures.length,
-      parameters: data.parameters || {},
-      errors: data.errors || {},
-      message:
-        fixtures.length > 0
-          ? "Matchs récupérés avec succès."
-          : "Aucun match renvoyé par l'API pour cette date.",
+      parameters: { dateFrom: date, dateTo: date },
+      errors: {},
+      message: fixtures.length
+        ? "Matchs récupérés avec succès depuis football-data.org."
+        : "Aucun match disponible pour cette date dans les compétitions accessibles.",
       fixtures,
     });
   } catch (error) {
-    console.error("Erreur API-Football :", error.message);
+    console.error("Erreur football-data.org:", error.message);
 
-    res.status(502).json({
+    return res.status(502).json({
       error:
         error.name === "TimeoutError"
-          ? "L'API-Football met trop de temps à répondre."
-          : "Impossible de contacter API-Football.",
+          ? "football-data.org met trop de temps à répondre."
+          : "Impossible de contacter football-data.org.",
     });
   }
 }
@@ -117,7 +132,7 @@ app.get("/api/fixtures/today", getFixtures);
 app.get("/api/fixtures", getFixtures);
 
 app.get("*", (req, res) => {
-  res.sendFile(require("path").join(__dirname, "public", "index.html"));
+  res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
 app.listen(PORT, () => {
