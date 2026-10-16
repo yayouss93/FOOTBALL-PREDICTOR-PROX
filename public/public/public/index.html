@@ -1,0 +1,173 @@
+
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#07111f">
+  <title>Football Predictor Pro</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: Arial, sans-serif;
+      background: #07111f; color: #f5f7fb;
+    }
+    header {
+      padding: 24px 18px;
+      background: linear-gradient(135deg, #102b46, #087f5b);
+      border-bottom: 1px solid #24445b;
+    }
+    .brand { font-size: 12px; color: #9fffd7; letter-spacing: 2px; }
+    h1 { margin: 10px 0; font-size: 27px; }
+    header p { color: #d4e6e2; line-height: 1.5; }
+    main { max-width: 760px; margin: auto; padding: 18px; }
+    .panel {
+      background: #111e30; border: 1px solid #25354b;
+      padding: 17px; border-radius: 15px; margin-bottom: 16px;
+    }
+    .row { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+    .muted { color: #a9b8cb; font-size: 13px; line-height: 1.5; }
+    button {
+      border: 0; border-radius: 10px; padding: 12px 15px;
+      background: #13b981; color: #03150f; font-weight: bold;
+      cursor: pointer;
+    }
+    input {
+      width: 100%; padding: 13px; margin: 12px 0;
+      border-radius: 10px; border: 1px solid #35465d;
+      background: #081525; color: white; font-size: 16px;
+    }
+    .match {
+      background: #0b1727; border: 1px solid #26364b;
+      padding: 15px; border-radius: 12px; margin-top: 12px;
+    }
+    .teams { font-weight: bold; line-height: 1.7; }
+    .tag {
+      display: inline-block; padding: 5px 8px; border-radius: 6px;
+      background: #173b35; color: #9fffd7; font-size: 11px;
+    }
+    #status { margin-top: 12px; }
+    footer { padding: 24px 18px; text-align: center; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">FOOTBALL • DATA • ANALYSIS</div>
+    <h1>⚽ Football Predictor Pro</h1>
+    <p>Les matchs du jour et des analyses fondées sur les données disponibles.</p>
+    <span class="tag">VERSION BÊTA</span>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div class="row">
+        <h2>📡 État du service</h2>
+        <button id="refresh">Actualiser</button>
+      </div>
+      <p id="status" class="muted">Vérification du serveur…</p>
+    </section>
+
+    <section class="panel">
+      <h2>📅 Matchs du jour</h2>
+      <p class="muted">Recherche un club parmi les rencontres récupérées.</p>
+      <input id="search" placeholder="Rechercher une équipe…" aria-label="Rechercher une équipe">
+      <div id="matches" class="muted">Chargement des matchs…</div>
+    </section>
+
+    <section class="panel">
+      <h2>🧠 À propos des pronostics</h2>
+      <p class="muted">
+        Les estimations doivent reposer sur des données réelles et suffisamment
+        complètes. Une probabilité n’est jamais une garantie de résultat.
+        Les prédictions détaillées seront ajoutées après la configuration
+        et les tests du moteur d’analyse.
+      </p>
+    </section>
+  </main>
+
+  <footer class="muted">Football Predictor Pro · Les matchs et statistiques dépendent de l’API configurée.</footer>
+
+  <script>
+    const statusBox = document.getElementById("status");
+    const matchesBox = document.getElementById("matches");
+    const searchBox = document.getElementById("search");
+    let fixtures = [];
+
+    function showMatches() {
+      const query = searchBox.value.trim().toLowerCase();
+      const filtered = fixtures.filter(item => {
+        const home = item.teams?.home?.name || "";
+        const away = item.teams?.away?.name || "";
+        return (home + " " + away).toLowerCase().includes(query);
+      });
+
+      if (!filtered.length) {
+        matchesBox.textContent = fixtures.length
+          ? "Aucun match ne correspond à cette recherche."
+          : "Aucun match disponible pour le moment.";
+        return;
+      }
+
+      matchesBox.replaceChildren();
+      filtered.forEach(item => {
+        const card = document.createElement("article");
+        card.className = "match";
+
+        const league = document.createElement("div");
+        league.className = "muted";
+        league.textContent = item.league?.name || "Compétition";
+
+        const teams = document.createElement("div");
+        teams.className = "teams";
+        teams.textContent =
+          (item.teams?.home?.name || "Équipe à confirmer") +
+          " vs " +
+          (item.teams?.away?.name || "Équipe à confirmer");
+
+        const time = document.createElement("div");
+        time.className = "muted";
+        time.textContent = item.fixture?.date
+          ? new Date(item.fixture.date).toLocaleString("fr-FR", {
+              dateStyle: "short", timeStyle: "short"
+            })
+          : "Horaire indisponible";
+
+        card.append(league, teams, time);
+        matchesBox.append(card);
+      });
+    }
+
+    async function loadMatches() {
+      statusBox.textContent = "Connexion au serveur…";
+      matchesBox.textContent = "Chargement…";
+
+      try {
+        const health = await fetch("/api/health");
+        if (!health.ok) throw new Error("Serveur indisponible");
+        const info = await health.json();
+
+        statusBox.textContent = info.apiKeyConfigured
+          ? "Serveur actif. Chargement des données…"
+          : "Serveur actif, mais la clé API n’est pas encore configurée.";
+
+        const response = await fetch("/api/fixtures/today");
+        const data = await response.json();
+
+        if (!response.ok) throw new Error(data.error || "Erreur de chargement");
+
+        fixtures = data.fixtures || [];
+        showMatches();
+        statusBox.textContent += " " + fixtures.length + " rencontre(s) récupérée(s).";
+      } catch (error) {
+        fixtures = [];
+        matchesBox.textContent = "Les matchs ne sont pas encore disponibles. Vérifie la configuration du serveur et de l’API.";
+        statusBox.textContent = error.message;
+      }
+    }
+
+    searchBox.addEventListener("input", showMatches);
+    document.getElementById("refresh").addEventListener("click", loadMatches);
+    loadMatches();
+  </script>
+</body>
+</html>
