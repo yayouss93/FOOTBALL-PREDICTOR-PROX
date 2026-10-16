@@ -1,14 +1,15 @@
-
 require("dotenv").config();
 
 const express = require("express");
 const path = require("path");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+
+// Configuration du serveur
+const PORT = process.env.PORT || 10000;
 const TIMEZONE = process.env.TIMEZONE || "Africa/Abidjan";
 
-// Clé du fournisseur de matchs existant.
+// Clés API
 const API_KEY =
   process.env.FOOTBALL_DATA_TOKEN || process.env.APIFOOTBALL_KEY;
 
@@ -17,10 +18,11 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.5";
 
 const API_BASE = "https://api.football-data.org/v4";
 
-// Cache en mémoire pour limiter les appels IA répétés.
+// Cache en mémoire pour limiter les appels IA répétés
 const aiCache = new Map();
 const AI_CACHE_MS = 12 * 60 * 60 * 1000;
 
+// Compétitions disponibles
 const COMPETITIONS = {
   WC: "Coupe du Monde de la FIFA",
   CL: "Ligue des champions de l'UEFA",
@@ -38,8 +40,10 @@ const COMPETITIONS = {
 
 const DEFAULT_COMPETITIONS = Object.keys(COMPETITIONS);
 
+// Servir les fichiers du dossier public
 app.use(express.static(path.join(__dirname, "public")));
 
+// Obtenir la date du jour selon le fuseau horaire
 function getToday() {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: TIMEZONE,
@@ -59,6 +63,7 @@ function getToday() {
   return `${values.year}-${values.month}-${values.day}`;
 }
 
+// Vérifier le format d'une date
 function isValidDate(date) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
     return false;
@@ -72,6 +77,7 @@ function isValidDate(date) {
   );
 }
 
+// Déterminer les compétitions demandées
 function getRequestedCompetitions(req) {
   const requested = req.query.competitions || req.query.competition;
 
@@ -94,6 +100,7 @@ function getRequestedCompetitions(req) {
   return [...new Set(codes)];
 }
 
+// Uniformiser les données d'un match
 function mapMatch(match) {
   return {
     teams: {
@@ -122,7 +129,7 @@ function mapMatch(match) {
   };
 }
 
-// Vérifie le fonctionnement du serveur.
+// Vérifier le fonctionnement du serveur et les clés
 app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
@@ -136,7 +143,7 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// Liste des compétitions disponibles.
+// Liste des compétitions disponibles
 app.get("/api/competitions", (req, res) => {
   res.json({
     count: DEFAULT_COMPETITIONS.length,
@@ -147,7 +154,7 @@ app.get("/api/competitions", (req, res) => {
   });
 });
 
-// Récupère les matchs d'une journée.
+// Récupérer les matchs d'une journée
 async function getFixtures(req, res) {
   const date = String(req.query.date || getToday());
 
@@ -174,6 +181,7 @@ async function getFixtures(req, res) {
 
   try {
     const url = new URL(`${API_BASE}/matches`);
+
     url.searchParams.set("date", date);
     url.searchParams.set("competitions", competitionCodes.join(","));
 
@@ -251,7 +259,7 @@ async function getFixtures(req, res) {
 app.get("/api/fixtures/today", getFixtures);
 app.get("/api/fixtures", getFixtures);
 
-// Extrait le texte d'une réponse OpenAI.
+// Extraire le texte d'une réponse OpenAI
 function extractAIText(data) {
   if (typeof data.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
@@ -275,12 +283,11 @@ function extractAIText(data) {
   return parts.join("\n").trim();
 }
 
-// Récupère les liens de sources disponibles dans la réponse.
+// Extraire les sources citées dans la réponse OpenAI
 function extractAISources(data) {
   const sources = new Map();
 
   for (const item of data.output || []) {
-    // Sources fournies par l'outil de recherche Web.
     for (const source of item.action?.sources || []) {
       if (source.url) {
         sources.set(source.url, {
@@ -290,7 +297,6 @@ function extractAISources(data) {
       }
     }
 
-    // Sources citées dans le texte final.
     for (const content of item.content || []) {
       for (const annotation of content.annotations || []) {
         if (annotation.url) {
@@ -300,7 +306,10 @@ function extractAISources(data) {
           });
         }
 
-        if (annotation.type === "url_citation" && annotation.url_citation?.url) {
+        if (
+          annotation.type === "url_citation" &&
+          annotation.url_citation?.url
+        ) {
           const citation = annotation.url_citation;
 
           sources.set(citation.url, {
@@ -315,7 +324,7 @@ function extractAISources(data) {
   return [...sources.values()];
 }
 
-// Analyse IA des matchs de la journée avec recherche Web.
+// Analyse IA des matchs de la journée
 app.get("/api/ai-analysis", async (req, res) => {
   const date = String(req.query.date || getToday());
 
@@ -349,8 +358,9 @@ app.get("/api/ai-analysis", async (req, res) => {
   }
 
   try {
-    // Étape 1 : récupérer les matchs du jour.
+    // Étape 1 : récupérer les matchs du jour
     const fixturesURL = new URL(`${API_BASE}/matches`);
+
     fixturesURL.searchParams.set("date", date);
     fixturesURL.searchParams.set(
       "competitions",
@@ -399,7 +409,7 @@ app.get("/api/ai-analysis", async (req, res) => {
       return res.json(emptyResult);
     }
 
-    // Limite le nombre de matchs envoyés dans une seule requête IA.
+    // Limiter à 20 matchs par demande IA
     const selectedMatches = matches.slice(0, 20);
 
     const matchList = selectedMatches.map((match, index) => ({
@@ -448,7 +458,7 @@ RÈGLES STRICTES :
 Organise la réponse avec des titres lisibles, un match par section.
 `;
 
-    // Étape 2 : demander à OpenAI d'effectuer la recherche Web.
+    // Étape 2 : demander l'analyse à OpenAI avec recherche Web
     const aiResponse = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
@@ -517,18 +527,15 @@ Organise la réponse avec des titres lisibles, un match par section.
   }
 });
 
-// Sert la page du site après les routes API.
+// Afficher la page principale du site
 app.get(/.*/, (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-
-const PORT = process.env.PORT || 10000;
-
+// Démarrer le serveur : une seule déclaration de PORT et un seul app.listen
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Serveur lancé sur le port ${PORT}`);
   console.log(`Fuseau horaire : ${TIMEZONE}`);
   console.log(`Clé football-data.org configurée : ${Boolean(API_KEY)}`);
   console.log(`Clé OpenAI configurée : ${Boolean(OPENAI_API_KEY)}`);
 });
-
