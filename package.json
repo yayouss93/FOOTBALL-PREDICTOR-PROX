@@ -1,0 +1,19 @@
+{
+  "name": "football-predictor-prox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pronostics football avec API-Football",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2"
+  }
+}
