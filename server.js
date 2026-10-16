@@ -522,9 +522,13 @@ app.get(/.*/, (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-app.listen(PORT, () => {
+
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Serveur lancé sur le port ${PORT}`);
   console.log(`Fuseau horaire : ${TIMEZONE}`);
   console.log(`Clé football-data.org configurée : ${Boolean(API_KEY)}`);
   console.log(`Clé OpenAI configurée : ${Boolean(OPENAI_API_KEY)}`);
 });
+
